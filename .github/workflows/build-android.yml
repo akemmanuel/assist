@@ -25,6 +25,11 @@ jobs:
           distribution: "temurin"
           java-version: "21"
 
+      - name: Setup Node 22 for Capacitor CLI
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Build web assets
         run: bun run build
 
