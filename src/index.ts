@@ -7,15 +7,150 @@ type OpenCodeModel = {
   modelID: string;
 };
 
+type OpenCodeConnectionInput = {
+  baseUrl: string;
+  username?: string;
+  password?: string;
+};
+
+type OpenCodeConnectionState = {
+  baseUrl: string;
+  username: string;
+  password: string;
+  connected: boolean;
+  lastError: string;
+};
+
 const DEFAULT_OPENCODE_BASE_URL = process.env.OPENCODE_BASE_URL ?? "http://127.0.0.1:4096";
-let openCodeBaseUrl = DEFAULT_OPENCODE_BASE_URL;
-let opencodeClient = createOpencodeClient({ baseUrl: openCodeBaseUrl });
+const DEFAULT_OPENCODE_USERNAME = process.env.OPENCODE_SERVER_USERNAME ?? "opencode";
+
+let openCodeConfig: OpenCodeConnectionState = {
+  baseUrl: DEFAULT_OPENCODE_BASE_URL,
+  username: "",
+  password: "",
+  connected: false,
+  lastError: "Not connected",
+};
+
+let openCodeAuthHeader = createBasicAuthHeader(openCodeConfig.username, openCodeConfig.password);
+let opencodeClient = createOpenCodeClient(openCodeConfig);
 const chatToSession = new Map<string, string>();
 
-function setOpenCodeBaseUrl(nextBaseUrl: string) {
-  openCodeBaseUrl = nextBaseUrl;
-  opencodeClient = createOpencodeClient({ baseUrl: openCodeBaseUrl });
+function normalizeConnectionInput(input: OpenCodeConnectionInput): OpenCodeConnectionState {
+  return {
+    baseUrl: input.baseUrl.trim(),
+    username: input.username?.trim() ?? "",
+    password: input.password?.trim() ?? "",
+    connected: false,
+    lastError: "Not connected",
+  };
+}
+
+function createBasicAuthHeader(username?: string, password?: string) {
+  if (!password) return undefined;
+  const resolvedUsername = username?.trim() || DEFAULT_OPENCODE_USERNAME;
+  return `Basic ${Buffer.from(`${resolvedUsername}:${password}`).toString("base64")}`;
+}
+
+function createAuthorizedFetch(authHeader?: string) {
+  return (request: Request) => {
+    const headers = new Headers(request.headers);
+    if (authHeader) headers.set("Authorization", authHeader);
+    return fetch(new Request(request, { headers }));
+  };
+}
+
+function createOpenCodeClient(config: Pick<OpenCodeConnectionState, "baseUrl" | "username" | "password">) {
+  const authHeader = createBasicAuthHeader(config.username, config.password);
+  return createOpencodeClient({
+    baseUrl: config.baseUrl,
+    ...(authHeader ? { fetch: createAuthorizedFetch(authHeader) } : {}),
+  });
+}
+
+function setOpenCodeConnection(nextConfig: OpenCodeConnectionState) {
+  openCodeConfig = nextConfig;
+  openCodeAuthHeader = createBasicAuthHeader(nextConfig.username, nextConfig.password);
+  opencodeClient = createOpenCodeClient(nextConfig);
   chatToSession.clear();
+}
+
+function connectionSnapshot() {
+  return {
+    baseUrl: openCodeConfig.baseUrl,
+    username: openCodeConfig.username,
+    connected: openCodeConfig.connected,
+    hasPassword: openCodeConfig.password.length > 0,
+    defaultBaseUrl: DEFAULT_OPENCODE_BASE_URL,
+    defaultUsername: DEFAULT_OPENCODE_USERNAME,
+    lastError: openCodeConfig.lastError,
+  };
+}
+
+function ensureConnected() {
+  if (openCodeConfig.connected) return null;
+  return Response.json(
+    {
+      error: "OpenCode connection is required",
+      ...connectionSnapshot(),
+    },
+    { status: 503 },
+  );
+}
+
+async function verifyOpenCodeConnection(config: OpenCodeConnectionState) {
+  const client = createOpenCodeClient(config);
+  await client.config.providers() as any;
+}
+
+async function connectToOpenCode(input: OpenCodeConnectionInput) {
+  const nextConfig = normalizeConnectionInput(input);
+
+  if (!nextConfig.baseUrl) {
+    return {
+      ok: false as const,
+      status: 400,
+      body: { error: "baseUrl is required", ...connectionSnapshot() },
+    };
+  }
+
+  try {
+    const parsed = new URL(nextConfig.baseUrl);
+    if (!(parsed.protocol === "http:" || parsed.protocol === "https:")) {
+      return {
+        ok: false as const,
+        status: 400,
+        body: { error: "baseUrl must use http or https", ...connectionSnapshot() },
+      };
+    }
+  } catch {
+    return {
+      ok: false as const,
+      status: 400,
+      body: { error: "baseUrl must be a valid URL", ...connectionSnapshot() },
+    };
+  }
+
+  try {
+    await verifyOpenCodeConnection(nextConfig);
+    setOpenCodeConnection({ ...nextConfig, connected: true, lastError: "" });
+    return {
+      ok: true as const,
+      status: 200,
+      body: connectionSnapshot(),
+    };
+  } catch (error) {
+    setOpenCodeConnection({ ...nextConfig, connected: false, lastError: String(error) });
+    return {
+      ok: false as const,
+      status: 502,
+      body: {
+        error: "Failed to connect to OpenCode",
+        details: String(error),
+        ...connectionSnapshot(),
+      },
+    };
+  }
 }
 
 function unwrap<T>(value: any): T {
@@ -130,8 +265,13 @@ async function streamDeltasFromEventEndpoint(
   onStep: (part: any) => void,
   signal: AbortSignal,
 ) {
-  const response = await fetch(`${openCodeBaseUrl}/event`, {
-    headers: { Accept: "text/event-stream" },
+  const headers = new Headers({ Accept: "text/event-stream" });
+  if (openCodeAuthHeader) {
+    headers.set("Authorization", openCodeAuthHeader);
+  }
+
+  const response = await fetch(`${openCodeConfig.baseUrl}/event`, {
+    headers,
     signal,
   });
   if (!response.ok || !response.body) {
@@ -241,6 +381,9 @@ const server = serve({
     },
 
     "/api/ai/options": async () => {
+      const disconnected = ensureConnected();
+      if (disconnected) return disconnected;
+
       try {
         const [agentsRes, providersRes] = await Promise.all([
           opencodeClient.app.agents() as any,
@@ -290,34 +433,36 @@ const server = serve({
 
     "/api/ai/config": {
       async GET() {
-        return Response.json({
-          baseUrl: openCodeBaseUrl,
-          defaultBaseUrl: DEFAULT_OPENCODE_BASE_URL,
-        });
+        return Response.json(connectionSnapshot());
       },
       async PUT(req) {
         const body = await req.json().catch(() => ({}));
-        const baseUrl = typeof body?.baseUrl === "string" ? body.baseUrl.trim() : "";
-        if (!baseUrl) {
-          return Response.json({ error: "baseUrl is required" }, { status: 400 });
-        }
+        const result = await connectToOpenCode({
+          baseUrl: typeof body?.baseUrl === "string" ? body.baseUrl : "",
+          username: typeof body?.username === "string" ? body.username : "",
+          password: typeof body?.password === "string" ? body.password : "",
+        });
+        return Response.json(result.body, { status: result.status });
+      },
+    },
 
-        try {
-          const parsed = new URL(baseUrl);
-          if (!(parsed.protocol === "http:" || parsed.protocol === "https:")) {
-            return Response.json({ error: "baseUrl must use http or https" }, { status: 400 });
-          }
-        } catch {
-          return Response.json({ error: "baseUrl must be a valid URL" }, { status: 400 });
-        }
-
-        setOpenCodeBaseUrl(baseUrl);
-        return Response.json({ baseUrl: openCodeBaseUrl });
+    "/api/ai/connect": {
+      async POST(req) {
+        const body = await req.json().catch(() => ({}));
+        const result = await connectToOpenCode({
+          baseUrl: typeof body?.baseUrl === "string" ? body.baseUrl : "",
+          username: typeof body?.username === "string" ? body.username : "",
+          password: typeof body?.password === "string" ? body.password : "",
+        });
+        return Response.json(result.body, { status: result.status });
       },
     },
 
     "/api/chat/stream": {
       async POST(req) {
+        const disconnected = ensureConnected();
+        if (disconnected) return disconnected;
+
         const encoder = new TextEncoder();
         const body = await req.json().catch(() => ({}));
         const chatId = typeof body?.chatId === "string" ? body.chatId : "default";

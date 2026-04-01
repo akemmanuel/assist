@@ -14,8 +14,8 @@ import {
   Paperclip,
   Settings,
   ArrowUp,
+  LoaderCircle,
   MessageSquarePlus,
-  Trash2,
   Lightbulb,
   Code,
   Pen,
@@ -43,6 +43,7 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
+import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import {
   Tooltip,
@@ -155,6 +156,37 @@ type ModelOption = { providerID: string; modelID: string; label: string };
 
 type ModelSelection = { providerID: string; modelID: string };
 
+type ConnectionForm = {
+  baseUrl: string;
+  username: string;
+  password: string;
+};
+
+const CONNECTION_STORAGE_KEY = "opencode.connection";
+
+function readStoredConnection(): ConnectionForm {
+  if (typeof window === "undefined") {
+    return { baseUrl: "", username: "", password: "" };
+  }
+
+  try {
+    const raw = localStorage.getItem(CONNECTION_STORAGE_KEY);
+    if (!raw) return { baseUrl: "", username: "", password: "" };
+    const parsed = JSON.parse(raw) as Partial<ConnectionForm>;
+    return {
+      baseUrl: typeof parsed.baseUrl === "string" ? parsed.baseUrl : "",
+      username: typeof parsed.username === "string" ? parsed.username : "",
+      password: typeof parsed.password === "string" ? parsed.password : "",
+    };
+  } catch {
+    return { baseUrl: "", username: "", password: "" };
+  }
+}
+
+function writeStoredConnection(value: ConnectionForm) {
+  localStorage.setItem(CONNECTION_STORAGE_KEY, JSON.stringify(value));
+}
+
 function encodeModelSelection(model: ModelSelection) {
   return JSON.stringify(model);
 }
@@ -258,9 +290,16 @@ function ChatArea() {
   const [models, setModels] = useState<ModelOption[]>([]);
   const [selectedAgent, setSelectedAgent] = useState("");
   const [selectedModel, setSelectedModel] = useState("");
-  const [baseUrl, setBaseUrl] = useState("");
-  const [isSavingBaseUrl, setIsSavingBaseUrl] = useState(false);
-  const [baseUrlStatus, setBaseUrlStatus] = useState("");
+  const [connectionForm, setConnectionForm] = useState<ConnectionForm>({
+    baseUrl: "",
+    username: "",
+    password: "",
+  });
+  const [isBootstrappingConnection, setIsBootstrappingConnection] = useState(true);
+  const [isConnected, setIsConnected] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState("");
+  const [connectionDetails, setConnectionDetails] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const threadRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLFormElement>(null);
@@ -268,7 +307,7 @@ function ChatArea() {
   const nextId = useRef(1);
   const [suggestions] = useState(() => pickRandom(ALL_SUGGESTIONS, 3));
 
-  const canSend = useMemo(() => input.trim().length > 0 && !isStreaming, [input, isStreaming]);
+  const canSend = useMemo(() => input.trim().length > 0 && !isStreaming && isConnected, [input, isStreaming, isConnected]);
 
   const loadAiOptions = useCallback(async () => {
     const storedAgent = localStorage.getItem("ai.agent") ?? "";
@@ -277,17 +316,7 @@ function ChatArea() {
     setSelectedModel(storedModel);
 
     try {
-      const [optionsResponse, configResponse] = await Promise.all([
-        fetch("/api/ai/options"),
-        fetch("/api/ai/config"),
-      ]);
-
-      if (configResponse.ok) {
-        const configData = await configResponse.json();
-        if (typeof configData?.baseUrl === "string") {
-          setBaseUrl(configData.baseUrl);
-        }
-      }
+      const optionsResponse = await fetch("/api/ai/options");
 
       if (!optionsResponse.ok) return;
       const data = await optionsResponse.json();
@@ -309,9 +338,112 @@ function ChatArea() {
     }
   }, []);
 
+  const connectToServer = useCallback(
+    async (nextForm: ConnectionForm, silent = false) => {
+      setIsConnecting(true);
+      if (!silent) {
+        setConnectionStatus("");
+        setConnectionDetails("");
+      }
+
+      try {
+        const response = await fetch("/api/ai/connect", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(nextForm),
+        });
+        const data = await response.json().catch(() => ({}));
+
+        setConnectionForm({
+          baseUrl: typeof data?.baseUrl === "string" ? data.baseUrl : nextForm.baseUrl,
+          username: typeof data?.username === "string" ? data.username : nextForm.username,
+          password: nextForm.password,
+        });
+
+        if (!response.ok) {
+          setIsConnected(false);
+          setConnectionStatus(data?.error ?? "Failed to connect to OpenCode");
+          setConnectionDetails(data?.details ?? data?.lastError ?? "");
+          return false;
+        }
+
+        writeStoredConnection({
+          baseUrl: typeof data?.baseUrl === "string" ? data.baseUrl : nextForm.baseUrl,
+          username: typeof data?.username === "string" ? data.username : nextForm.username,
+          password: nextForm.password,
+        });
+        setIsConnected(true);
+        setConnectionStatus("Connected");
+        setConnectionDetails("");
+        await loadAiOptions();
+        return true;
+      } catch (error) {
+        setIsConnected(false);
+        setConnectionStatus("Failed to connect to OpenCode");
+        setConnectionDetails(String(error));
+        return false;
+      } finally {
+        setIsConnecting(false);
+      }
+    },
+    [loadAiOptions],
+  );
+
   useEffect(() => {
-    loadAiOptions();
-  }, [loadAiOptions]);
+    let cancelled = false;
+
+    const bootstrapConnection = async () => {
+      const stored = readStoredConnection();
+      setConnectionForm(stored);
+
+      try {
+        const response = await fetch("/api/ai/config");
+        const configData = await response.json().catch(() => ({}));
+
+        if (cancelled) return;
+
+        if (typeof configData?.baseUrl === "string" || typeof configData?.username === "string") {
+          setConnectionForm(prev => ({
+            baseUrl: prev.baseUrl || configData.baseUrl || "",
+            username: prev.username || configData.username || "",
+            password: prev.password,
+          }));
+        }
+
+        if (configData?.connected) {
+          setIsConnected(true);
+          setConnectionStatus("Connected");
+          setConnectionDetails("");
+          await loadAiOptions();
+          return;
+        }
+
+        if (stored.baseUrl) {
+          await connectToServer(stored, true);
+          return;
+        }
+
+        if (typeof configData?.lastError === "string" && configData.lastError !== "Not connected") {
+          setConnectionStatus(configData.lastError);
+        }
+      } catch {
+        if (stored.baseUrl) {
+          await connectToServer(stored, true);
+          return;
+        }
+      } finally {
+        if (!cancelled) {
+          setIsBootstrappingConnection(false);
+        }
+      }
+    };
+
+    bootstrapConnection();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [connectToServer, loadAiOptions]);
 
   useEffect(() => {
     localStorage.setItem("ai.agent", selectedAgent);
@@ -334,9 +466,23 @@ function ChatArea() {
     return () => window.removeEventListener("assistantTriggered", onAssistantTriggered);
   }, []);
 
+  const updateConnectionField = useCallback((field: keyof ConnectionForm, value: string) => {
+    setConnectionForm(prev => ({ ...prev, [field]: value }));
+  }, []);
+
+  const submitConnection = useCallback(async () => {
+    const nextForm = {
+      baseUrl: connectionForm.baseUrl.trim(),
+      username: connectionForm.username.trim(),
+      password: connectionForm.password,
+    };
+    setConnectionForm(nextForm);
+    await connectToServer(nextForm);
+  }, [connectToServer, connectionForm]);
+
   const sendMessage = async () => {
     const text = input.trim();
-    if (!text || isStreaming) return;
+    if (!text || isStreaming || !isConnected) return;
 
     const assistantId = nextId.current + 1;
 
@@ -549,28 +695,90 @@ function ChatArea() {
 
   const { theme, toggleTheme } = useTheme();
 
-  const saveBaseUrl = async () => {
-    setBaseUrlStatus("");
-    setIsSavingBaseUrl(true);
-    try {
-      const response = await fetch("/api/ai/config", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ baseUrl }),
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        setBaseUrlStatus(data?.error ?? "Failed to save base URL");
-        return;
-      }
-      setBaseUrlStatus("Saved");
-      await loadAiOptions();
-    } catch {
-      setBaseUrlStatus("Failed to save base URL");
-    } finally {
-      setIsSavingBaseUrl(false);
-    }
-  };
+  if (isBootstrappingConnection) {
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-background px-6">
+        <div className="flex max-w-sm flex-col items-center gap-4 text-center">
+          <LoaderCircle className="size-8 animate-spin text-muted-foreground" />
+          <div className="space-y-1">
+            <h1 className="text-2xl font-semibold tracking-tight text-foreground">Connecting to OpenCode</h1>
+            <p className="text-sm text-muted-foreground">Assist checks your saved server connection before the app unlocks.</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!isConnected) {
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-[radial-gradient(circle_at_top,_hsl(var(--primary)/0.16),_transparent_40%),linear-gradient(180deg,_hsl(var(--background)),_hsl(var(--muted)/0.65))] px-4 py-6">
+        <form
+          onSubmit={event => {
+            event.preventDefault();
+            submitConnection();
+          }}
+          className="w-full max-w-md rounded-[2rem] border border-border/70 bg-card/95 p-6 shadow-2xl shadow-black/10 backdrop-blur"
+        >
+          <div className="space-y-2">
+            <p className="text-xs font-medium uppercase tracking-[0.24em] text-muted-foreground">Required Connection</p>
+            <h1 className="text-3xl font-semibold tracking-tight text-foreground">Connect to your OpenCode server</h1>
+            <p className="text-sm leading-relaxed text-muted-foreground">
+              Assist stays locked until it reaches OpenCode. Username and password are optional and only needed when the
+              server uses Basic Auth.
+            </p>
+          </div>
+
+          <div className="mt-6 space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="connect-base-url">OpenCode Base URL</Label>
+              <Input
+                id="connect-base-url"
+                type="url"
+                value={connectionForm.baseUrl}
+                onChange={event => updateConnectionField("baseUrl", event.target.value)}
+                placeholder="http://127.0.0.1:4096"
+                autoComplete="url"
+              />
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="connect-username">Username</Label>
+              <Input
+                id="connect-username"
+                value={connectionForm.username}
+                onChange={event => updateConnectionField("username", event.target.value)}
+                placeholder="opencode"
+                autoComplete="username"
+              />
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="connect-password">Password</Label>
+              <Input
+                id="connect-password"
+                type="password"
+                value={connectionForm.password}
+                onChange={event => updateConnectionField("password", event.target.value)}
+                placeholder="Optional"
+                autoComplete="current-password"
+              />
+            </div>
+          </div>
+
+          {(connectionStatus || connectionDetails) && (
+            <div className="mt-5 rounded-2xl border border-border bg-muted/40 px-4 py-3 text-sm">
+              {connectionStatus && <p className="font-medium text-foreground">{connectionStatus}</p>}
+              {connectionDetails && <p className="mt-1 text-muted-foreground break-words">{connectionDetails}</p>}
+            </div>
+          )}
+
+          <Button type="submit" className="mt-6 w-full" disabled={isConnecting || !connectionForm.baseUrl.trim()}>
+            {isConnecting ? "Connecting..." : "Connect and open Assist"}
+          </Button>
+        </form>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col h-full">
@@ -610,22 +818,46 @@ function ChatArea() {
 
               <div>
                 <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-3">AI</p>
-                <div className="space-y-2">
+                <div className="space-y-3">
                   <Label htmlFor="base-url" className="text-sm font-medium">OpenCode Base URL</Label>
-                  <div className="flex items-center gap-2">
-                    <input
-                      id="base-url"
-                      type="url"
-                      value={baseUrl}
-                      onChange={event => setBaseUrl(event.target.value)}
-                      placeholder="http://127.0.0.1:4096"
-                      className="h-9 w-full rounded-md border border-border bg-background px-3 text-sm text-foreground outline-none focus:ring-1 focus:ring-ring"
+                  <Input
+                    id="base-url"
+                    type="url"
+                    value={connectionForm.baseUrl}
+                    onChange={event => updateConnectionField("baseUrl", event.target.value)}
+                    placeholder="http://127.0.0.1:4096"
+                    autoComplete="url"
+                  />
+                  <div className="space-y-2">
+                    <Label htmlFor="settings-username" className="text-sm font-medium">Username</Label>
+                    <Input
+                      id="settings-username"
+                      value={connectionForm.username}
+                      onChange={event => updateConnectionField("username", event.target.value)}
+                      placeholder="opencode"
+                      autoComplete="username"
                     />
-                    <Button type="button" onClick={saveBaseUrl} disabled={isSavingBaseUrl}>
-                      {isSavingBaseUrl ? "Saving..." : "Save"}
-                    </Button>
                   </div>
-                  {baseUrlStatus && <p className="text-xs text-muted-foreground">{baseUrlStatus}</p>}
+                  <div className="space-y-2">
+                    <Label htmlFor="settings-password" className="text-sm font-medium">Password</Label>
+                    <Input
+                      id="settings-password"
+                      type="password"
+                      value={connectionForm.password}
+                      onChange={event => updateConnectionField("password", event.target.value)}
+                      placeholder="Optional"
+                      autoComplete="current-password"
+                    />
+                  </div>
+                  <Button type="button" onClick={submitConnection} disabled={isConnecting || !connectionForm.baseUrl.trim()}>
+                    {isConnecting ? "Connecting..." : "Reconnect"}
+                  </Button>
+                  {(connectionStatus || connectionDetails) && (
+                    <p className="text-xs text-muted-foreground break-words">
+                      {connectionStatus}
+                      {connectionDetails ? ` - ${connectionDetails}` : ""}
+                    </p>
+                  )}
                 </div>
               </div>
             </div>
